@@ -1,0 +1,158 @@
+已修复，并且找到了真正的根因——比昨天定位的更深一层。
+
+真凶：你的 compaction 配置从来就没生效过
+~/.dsh/profiles/web/cordis.patch.yml 里那条 - id: compaction-basic 是空操作：
+
+web-app 把顶层 compaction-basic 置为 disabled: true，真正干活的是嵌在 preset-standard / preset-ptc / preset-cordis 里的三个实例；
+而 loader 的 buildMap（dsh-app-boot/lib/index.js 的 applyEntryPatches）只递归 group: true + config 数组；preset 是 @deepseek-ai/dsh-agent-preset，插件列表在 config.plugins 里 → 同 id 条目永远匹配不到，配置全落在 disabled 那条上。
+所以实际一直在跑默认值：maxTokens 默认 65536、thresholdRatio 默认 0.8、没有摘要目标。于是摘要请求落到会话模型上、max_tokens 被 pi-ai 钳成 contextWindow − 估算prompt − 4096 —— 这就是那批 23763/19931/35499 怪值的来源（65536−23763−4096 = 37677 是它的估算，服务端实际 50940，低估 26%）。
+
+改了什么
+位置	改动
+@deepseek-ai/dsh-web-app/presets/{standard,ptc,cordis}.patch.yml	把配置写到生效实例上：compaction 参数 + pruner 6144/3072/2048（原来一直是 8192/4096/1024）
+pi-ai/dist/utils/estimate.js	估算补上 context.tools（本机 26 个工具 schema ≈ 5153 tokens 原先完全没算）
+pi-ai/dist/api/simple-options.js	启发式部分 ×1.3（usage 精确值不放大）
+dsh-token-meter/lib/index.js	measure() 启发式 baseline/增量 ×1.25（压缩触发更早；负增量不放大）
+cordis.patch.yml	加显著警告注释；maxTokens 4096→8192；摘要目标 deepseek-account/deepseek-chat → deepseek-official/deepseek-flash（凭据里没有 deepseek-account-platform 记录，走 account 会抛 ACCOUNT_SIGN_IN_REQUIRED；flash 是 api-key 路由且窗口 1M）
+skill §4/§4.1/§6	新增坑 8/9/10 与补丁清单、判据、修法
+验证证据
+dsh --profile web --dump-config（与真实启动同一套补丁语义）：修复前只有 disabled 那条带 config；修复后三个生效实例全部带上 config ✅
+补丁单元验证：verify-compaction-patches.mjs —— 大 prompt 场景旧值 8192（必 400）→ 新值 1（安全）；usage 锚点场景精确值不被放大 ✅
+现行服务 PID 921070 启动于 21:02:30，晚于代码补丁 mtime ✅
+接下来会发生什么
+25 秒后会自动重启 dsh web 一次（脚本 restart-dsh-web.sh，日志 dsh-web-restart.log），GUI 断线约 1 分钟——因为 preset 配置是 bundle 层文件，live 热加载读不到，必须重启。重启后：
+
+当前 kvmem 256k：触发点 186880、保留 57600；strata/64k：触发点 47842、保留 14745
+压缩失败的两种症状都已被针对性修掉：exceeds the context…never truncated（max_tokens 钳制 + 提前触发）、summarization truncated at the token cap（maxTokens 4096→8192）
+想事后自查某次压缩，直接看会话日志里的 compaction/end 是否带 error 即可：
+
+bash
+
+
+zstdcat ~/.dsh/sessions/--home-qiang65-deepseek~5DE5~4F5C~76EE~5F55--/<session>/session.v4.jsonl.zstd \
+  | grep -o '"compaction/end".\{0,200\}'
+一点提醒：摘要现在会发给 DeepSeek 云端（deepseek-flash，与你原本配的 deepseek-chat 同族、只是认证路由换成可用的 api-key）。若你希望摘要留在本地（比如走 kvmem 的 Qwen 模型），把三处 preset 文件里的 summarizationProvider/Model 改成 kvmem/Qwen3.8-27B-Uncensored-YMQ-XS-Pro.gguf 即可。
+
+现在全部都修复好了吗？
+21:18
+
+已完成
+已完成，用时 2分44秒
+核验完毕。结论：能修的都修好并逐层验证过了，只剩「真实压缩一次」这个验收动作需要触发。
+
+现在的实测状态
+项	证据
+服务	单进程 PID 940972，启动 21:14:46 —— 晚于全部配置改动（21:12:42–21:12:50）→ 本地摘要配置已加载
+重启机制	日志完整：✅ 新 PID 940972（等待 3s），走 systemd user unit，不再出现脚本被回收
+三处生效实例	--dump-config：preset-standard/ptc/cordis 的 compaction-basic 全部带 summarizationProvider: kvmem + maxTokens: 8192，pruner 全部 6144/3072/2048
+代码补丁	pi-ai clamp（补 tools + 启发式 ×1.3）、token-meter（×1.25）已随服务加载；单元测试通过
+本地模型	18200 在线，n_ctx=262144，DSH 要发的 model id 精确匹配
+本地摘要压测	真实旧会话 replay（48,750 字符 / 17,623 真实 token）→ 耗时 87.6s、finish=stop、输出 3,454 token、Primary Request / Errors and Fixes / Next Step / Critical Context 四段结构齐 ✅
+新增加固	kvmem streamIdleTimeoutMs: 900000（profile 层，热加载）——压测显示 17.6k 要 87.6s，10 万级 replay 会逼近默认 5 分钟 idle 超时，这正是历史 stream idle timeout after 300000ms 的来源
+顺带量到一条硬数据：48,750 字符被本地分词器算成 17,623 token = 2.77 字符/token，而启发式按 4 字符/token 算 → 低估 1.45×。这从实测上证实了之前那批 23763/35499 怪值（估算低估）的机理。
+
+只剩一件事：真实压缩还没跑过
+配置、路由、代码、模型能力都各自验证过了，但**「一次完整的 compaction 事务」**还没在活会话里发生（当前会话远低于阈值）。你点一下就能验收：
+
+最快：在 GUI 里对任一有内容的会话敲 /compact（手动压缩，不等阈值）；
+或自然等：kvmem 256k 到 186,880、64k 模型到 47,842 就会自动压。
+压完自查（无 error 即成功）：
+
+bash
+
+
+zstdcat ~/.dsh/sessions/--home-qiang65-deepseek~5DE5~4F5C~76EE~5F55--/<session>/session.v4.jsonl.zstd \
+  | grep -o '"compaction/end".\{0,200\}'
+如果这次压出来了，说明整条链路（触发 → 裁剪 → 本地 27B 摘要 → 落 checkpoint）全通。
+
+三个要记住的代价
+纯本地 = 没有云端兜底：18200 没起来时压缩会以 connection error 失败。启动命令（正确那份）：
+bash
+
+
+nohup bash "/media/qiang65/data/ubuntusoftware/kvmem-v0.16.0-rc3-linux-x86_64-cuda13.2.86/scripts/linux/start-iq3.sh" > ~/kvmem-18200.log 2>&1 &
+大区间摘要慢：本地 27B 吞 10 万 token replay 可能 5–10 分钟，期间这一轮在等。想更快就把 thresholdRatio 调低（压得更勤、每次区间更小）。
+npx 缓存里的补丁升级会丢：pi-ai 两处 + token-meter 一处 + preset 三处配置，升级 dsh 后需按 dsh-orca-computer-use 技能 §4.1 / 坑 10 重打（已写清文件与位置）。
+另外提醒一句：摘要已 100% 本地，但本会话的主模型是你手动切的 deepseek-official/deepseek-flash（云端）。新建会话的默认模型在 profile 里仍是本地 kvmem，所以只要不手动切云端，主对话也是全本地；若你要求这台机器上的内容一律不出网，把这个会话的模型切回 kvmem 即可。
+
+
+我现在加载了64k模型，但在旧对话里还是说满了，是不是要开新的对话再测试 ？
+21:39
+
+已完成
+已完成，用时 2分26秒
+不用开新对话。 你那个旧对话其实是「能塞下」的，问题出在我上一轮的补丁 + 摘要目标指向了已停的服务。
+
+你看到「满了」的两个真实原因
+我从会话 session-ac22093b 的日志里挖出来了：
+
+① 那轮主请求根本没超上下文——服务端回报：
+
+代码块
+
+
+usage: {"inputTokens": 42929, "outputTokens": 1, "totalTokens": 42930}
+turn/end: max-tokens
+42,929 + 8,192 = 51,121 < 65,536，塞得下！但输出只有 1 个 token → 模型等于没说话，你看到的就是空响应/像"满了"。是我上一轮给 pi-ai 加的「启发式 ×1.3」在这种估算偏高的场景把 max_tokens 钳成了 1（那次估算 ≈61.4k，比真实 42.9k 高出一大截）。
+
+② 压缩确实触发了，但摘要失败：
+
+代码块
+
+
+21:36:45 compaction/prune ×3   ← 工具日志裁剪正常
+21:36:45 compaction/start
+21:36:45 compaction/end: error "Connection error."   ← 摘要目标 kvmem(18200) 已被你停掉
+摘要指向本机 kvmem，而你把 27B 卸了换成 8080 的 64k 模型 → 每次摘要都连不上 → 会话永远瘦不下来。
+
+已经改好的两处（20 秒后随重启生效）
+钳制不再静默空答：可用预算不足 1024 时不再钳，交回服务端按真实计数裁决——真超窗就报 400，触发 agent/request-error 的压缩+重试恢复路径（这才是"满了就压缩"的设计行为）。同时把放大系数从 1.3 降到 1.15（实测估算在 0.74×~1.1× 之间摆动，1.3 太激进）。 验证：大 prompt 场景旧逻辑给 1 → 现在给 8192。
+摘要目标改成你正在跑的本地模型，并按会话模型分派：
+默认 → strata / qwen3.8-flash-next-iq2_xs（8080，已实测 reply='正常'、finish=stop ✅）
+会话跑 kvmem 27B 时 → modelPolicies 自动改用 kvmem 自己（256k，能吞大区间）
+所以：现在该怎么做
+重启完成后直接在旧对话里继续发消息即可，不需要新开。预期行为：
+
+会话 ~43k → 主请求直接成功，正常回答（不再 1-token 空答）；
+会话涨过 47,842 → 自动压缩，摘要走 strata 本地模型；
+真的超窗 → 400 → 自动压缩后重试，不会再"卡死"。
+只有这两种情况才需要开新对话：
+
+旧会话的真实内容已经超过 64k（例如 b6fad7c4 那种在 256k 模型上养出来的大会话）——64k 主模型跑不了，64k 摘要模型也吞不下那段 replay。想救这类会话，把 kvmem 27B 启动起来，配置里的 modelPolicies 会让它用自己的 256k 窗口做摘要。
+你想干净地按 64k 阈值重新开始（老会话里堆积的工具输出再多也迟早要压）。
+另外提醒：strata 服务（8080）现在是压缩链路的依赖，你把它停掉时压缩会以 Connection error. 失败、会话就不再瘦身——这就是这次现象的来源。
+
+
+
+
+
+
+用量 6.7M tok
+21:42
+我是两个模型在同一台电脑上的，一次只能开一个，以后也会自动适应了吗？
+21:45
+
+已完成
+已完成，用时 54秒
+会，而且我刚把它改成了「完全自动适应」（这次不用再手动换配置了）。
+
+原理：摘要改成跟随会话当前模型
+插件的行为是——不指定 summarizationProvider，摘要就自动用「这个会话正在用的模型」。因为主请求能发出去就说明那个服务一定在跑，所以服务永远对得上：
+
+会话主模型	摘要用哪个	需要哪个服务在跑
+kvmem 27B（256k）	kvmem 自己	18200（就是它自己）
+strata 64k（8080）	strata 自己	8080（就是它自己）
+远程 llama 64k	llama 自己	那台 LAN 机器
+云端 deepseek-flash	强制走本地 strata	8080
+所以你「一次只开一个模型」的用法下：开哪个就用哪个做摘要，不用改任何配置、不用重启。之前的配置是「默认 strata + kvmem 会话例外」，虽然也覆盖你的两个模型，但换成 llama 就会错位；现在这个写法没有例外。
+
+唯一需要留意的场景是用云端主模型时：即使 GPU 空着，摘要也会去本地 8080（这是你「摘要不上云」的要求），所以那时把 strata 起起来就行——云端主模型不吃 GPU，两者其实可以共存。
+
+刚刚这轮改动
+改动	说明
+摘要目标	删掉固定值 → 跟随会话模型；modelPolicies 只给两个云端模型钉死本地 strata
+pi-ai 钳制（上一轮）	可用预算 < 1024 时不再钳到 1 个 token，交回服务端裁决（真超窗 → 400 → 自动压缩重试）；放大系数 1.3 → 1.15
+验证	--dump-config 确认生效实例已无固定摘要目标、只有两条云端策略；钳制单测通过（旧逻辑给 1，现在给 8192）
+15 秒后重启加载（约 3 秒起来、GUI 短暂闪一下）。重启后你就可以直接回那个旧对话继续——上次那轮的真实用量是 inputTokens: 42929 + 8192 = 51,121 < 65,536，本来塞得下，是钳制把输出压成 1 个 token 才显得「满了」；这个坑已经堵掉了。
+
+一句话总结你以后的操作习惯：换模型 = 换服务，别的都不用动；只要别在「用云端主模型」时把本地服务全关掉，压缩就一直是本地的、也不会再卡。
